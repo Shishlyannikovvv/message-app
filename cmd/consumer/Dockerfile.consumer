@@ -1,0 +1,19 @@
+# Stage 1: Builder
+FROM golang:1.23-alpine AS builder
+
+WORKDIR /app
+
+# Оптимизация кеширования
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Сборка
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o consumer ./cmd/consumer/main.go
+
+# Stage 2: Runtime
+FROM alpine:latest
+WORKDIR /root/
+COPY --from=builder /app/consumer .
+
+CMD ["./consumer"]

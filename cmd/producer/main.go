@@ -1,21 +1,91 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-func main() {
-	HandleFunchttp.("/send", sendMessageHandler)
-	log.Println("Producer listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+type App struct {
+	Channel *amqp.Channel
+	Queue   amqp.Queue
 }
 
-func sendMessageHandler(w http.ResponseWriter, r *http.Request) {
+func main() {
+	//Подключение к RabbitMQ
+	rmqURL := os.Getenv("RMQ_URL")
+	if rmqURL == "" {
+		rmqURL = "amqp://guest:guest@localhost:5672/"
+	}
+
+	conn, err := amqp.Dial(rmqURL)
+	if err != nil {
+		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
+	}
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	if err != nil {
+		log.Fatalf("Failed to open a channel: %v", err)
+	}
+	defer ch.Close()
+
+	q, err := ch.QueueDeclare(
+		"test_queue", // name
+		false,        // durable
+		false,        // delete when unused
+		false,        // exclusive
+		false,        // no-wait
+		nil,          // arguments
+	)
+	if err != nil {
+		log.Fatalf("Failed to declare a queue: %v", err)
+	}
+
+	app := &App{
+		Channel: ch,
+		Queue:   q,
+	}
+
+	//Настройка HTTP сервера
+	http.HandleFunc("/send", app.sendMessageHandler)
+
+	srv := &http.Server{
+		Addr: ":8080",
+	}
+
+	// Запуск сервера в горутине
+	go func() {
+		log.Println("Producer listening on :8080")
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("ListenAndServe: %v", err)
+		}
+	}()
+
+	// 3. Graceful Shutdown
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Println("Shutting down producer...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatalf("Server shutdown failed: %v", err)
+	}
+	log.Println("Producer shut down gracefully")
+}
+
+func (app *App) sendMessageHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
 		return
@@ -29,38 +99,26 @@ func sendMessageHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
-	if err != nil {
-		http.Error(w, "RMQ connect failed", http.StatusInternalServerError)
-		log.Printf("Error: %v", err)
-		return
-	}
-	defer conn.Close()
+	// Публикуем сообщение, используя уже открытый канал
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	ch, err := conn.Channel()
-	if err != nil {
-		http.Error(w, "RMQ channel failed", http.StatusInternalServerError)
-		log.Printf("Error: %v", err)
-		return
-	}
-	defer ch.Close()
+	err := app.Channel.PublishWithContext(ctx,
+		"",             // exchange
+		app.Queue.Name, // routing key
+		false,          // mandatory
+		false,          // immediate
+		amqp.Publishing{
+			ContentType: "text/plain",
+			Body:        []byte(msg.Message),
+		})
 
-	q, err := ch.QueueDeclare("test_queue", false, false, false, false, nil)
 	if err != nil {
-		http.Error(w, "Queue declare failed", http.StatusInternalServerError)
-		log.Printf("Error: %v", err)
+		http.Error(w, "Failed to publish message", http.StatusInternalServerError)
+		log.Printf("Error publishing: %v", err)
 		return
 	}
 
-	err = ch.Publish("", q.Name, false, false, amqp.Publishing{
-		ContentType: "text/plain",
-		Body:        []byte(msg.Message),
-	})
-	if err != nil {
-		http.Error(w, "Publish failed", http.StatusInternalServerError)
-		log.Printf("Error: %v", err)
-		return
-	}
-
+	w.WriteHeader(http.StatusOK)
 	fmt.Fprintln(w, "Message sent to RMQ")
 }
